@@ -20,7 +20,7 @@
 #endif
 
 #include "common/common_types.h"
-#include "common/logging/log.h"
+#include "common/logging.h"
 
 namespace Vulkan::PipelineBuildTrace {
 
