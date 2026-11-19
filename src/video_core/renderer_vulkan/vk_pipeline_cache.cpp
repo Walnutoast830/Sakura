@@ -446,7 +446,9 @@ size_t GetTotalPipelineWorkers() {
         std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
 #ifdef __ANDROID__
     const int configured = AndroidSettings::values.pipeline_worker_count.GetValue();
-    const int clamped = std::clamp(configured, 4, 8);
+    // 1 is allowed so drivers whose shader compiler misbehaves when called from several threads
+    // at once can be tested with one compile at a time; otherwise at least 4 workers.
+    const int clamped = configured == 1 ? 1 : std::clamp(configured, 4, 8);
     const size_t desired = static_cast<size_t>(clamped);
     if (desired == 0) {
         return 1ULL;
@@ -458,6 +460,12 @@ size_t GetTotalPipelineWorkers() {
 }
 
 size_t GetBootPipelineWorkers() {
+#ifdef __ANDROID__
+    // One worker means one compile at a time, at boot too.
+    if (AndroidSettings::values.pipeline_worker_count.GetValue() == 1) {
+        return 1ULL;
+    }
+#endif
     return std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL);
 }
 
@@ -493,9 +501,11 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       texture_cache{texture_cache_}, shader_notify{shader_notify_},
       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue()},
-      workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetBootPipelineWorkers(),
-              "VkPipelineBuilder"),
-      serialization_thread(1, "VkPipelineSerialization") {
+      worker_pool(std::make_unique<Common::ThreadWorker>(
+          device.HasBrokenParallelShaderCompiling() ? 1ULL : GetBootPipelineWorkers(),
+          "VkPipelineBuilder")),
+      serialization_pool(std::make_unique<Common::ThreadWorker>(1, "VkPipelineSerialization")),
+      workers(*worker_pool), serialization_thread(*serialization_pool) {
     play_workers = device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers();
     worker_threads = device.HasBrokenParallelShaderCompiling() ? 1ULL : GetBootPipelineWorkers();
     const auto& float_control{device.FloatControlProperties()};
@@ -696,6 +706,32 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
 }
 
 PipelineCache::~PipelineCache() {
+    if (stuck_builds.load(std::memory_order_relaxed) != 0) {
+        // Some workers are stuck inside the driver and will never return. Joining them (what
+        // destroying the pools does) would hang closing the game for good, and destroying the
+        // pipelines they are building would free objects the driver is still using. Leak both,
+        // and skip saving the driver cache: reading it could block on the stuck builds too. The
+        // periodic checkpoints have already saved it.
+        LOG_WARNING(Render_Vulkan,
+                    "[PipelineTimeout] {} build(s) still stuck at shutdown; leaving them running",
+                    stuck_builds.load(std::memory_order_relaxed));
+        // Healthy workers drop the queue and exit after their current task; stuck ones stay.
+        worker_pool->RequestStop();
+        serialization_pool->RequestStop();
+        static_cast<void>(worker_pool.release());
+        static_cast<void>(serialization_pool.release());
+        for (auto& [key, pipeline] : graphics_cache) {
+            if (pipeline && !pipeline->IsBuilt()) {
+                static_cast<void>(pipeline.release());
+            }
+        }
+        for (auto& [key, pipeline] : compute_cache) {
+            if (pipeline && !pipeline->IsBuilt()) {
+                static_cast<void>(pipeline.release());
+            }
+        }
+        return;
+    }
     if (!use_vulkan_pipeline_cache) {
         return;
     }
@@ -841,23 +877,36 @@ bool PipelineCache::WaitForUnskippable(Pipeline* pipeline, const char* kind, u64
                                        bool compute, u64 cache_key_hash) {
     if (pipeline->BuildGaveUp()) {
         // Already waited the full timeout once; skip without stalling again.
+        CheckForStuckBuild(pipeline, kind, hash, compute, cache_key_hash);
         return false;
     }
     if (pipeline->WaitUntilBuilt(PipelineBuildTrace::BUILD_TIMEOUT)) {
         return true;
     }
     if (pipeline->MarkBuildGaveUp()) {
-        LOG_ERROR(Render_Vulkan,
-                  "[PipelineTimeout] {} 0x{:016x} not built after {} ms; skipping its draws until "
-                  "the driver finishes it",
-                  kind, hash, PipelineBuildTrace::BUILD_TIMEOUT.count());
+        // Not necessarily stuck: it may only be queued behind other builds. Skip its draws until it
+        // is built; CheckForStuckBuild decides whether the driver is actually stuck on it.
+        LOG_WARNING(Render_Vulkan,
+                    "[PipelineTimeout] {} 0x{:016x} not built after {} ms; skipping its draws "
+                    "until it is",
+                    kind, hash, PipelineBuildTrace::BUILD_TIMEOUT.count());
     }
-    // The wait just covered BUILD_TIMEOUT, so the build counts as stuck now.
-    if (pipeline->ReportStuckOnce(std::chrono::milliseconds{0})) {
-        ReplaceStuckWorker();
-        RecordStuckPipeline(compute, cache_key_hash);
-    }
+    CheckForStuckBuild(pipeline, kind, hash, compute, cache_key_hash);
     return false;
+}
+
+template <typename Pipeline>
+void PipelineCache::CheckForStuckBuild(Pipeline* pipeline, const char* kind, u64 hash,
+                                       bool compute, u64 cache_key_hash) {
+    // Only a build a worker has spent STUCK_BUILD_AGE on counts. A queued pipeline is waiting for
+    // a worker, and recording it would skip a shader that builds fine for good.
+    if (!pipeline->ReportStuckOnce(PipelineBuildTrace::STUCK_BUILD_AGE)) {
+        return;
+    }
+    LOG_ERROR(Render_Vulkan, "[PipelineTimeout] {} 0x{:016x} stuck in the driver for over {} ms",
+              kind, hash, PipelineBuildTrace::STUCK_BUILD_AGE.count());
+    ReplaceStuckWorker();
+    RecordStuckPipeline(compute, cache_key_hash);
 }
 
 bool PipelineCache::IsStuckPipeline(bool compute, u64 cache_key_hash) {
@@ -1232,6 +1281,8 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
     if (pipeline->IsBuilt()) {
         return pipeline;
     }
+    const u64 hash{pipeline->KeyHash()};
+    CheckForStuckBuild(pipeline, "graphics", hash, false, hash);
     if (pipeline->BuildGaveUp()) {
         // An earlier draw already waited the full timeout on this pipeline: skip at once.
         return nullptr;
@@ -1244,22 +1295,12 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
         const bool must_wait =
             draw_state.index_buffer.count <= 6 || draw_state.vertex_buffer.count <= 6;
         if (!must_wait) {
-            // Skipped without waiting, but a build the driver never finishes still holds a
-            // worker. Replace it once the build has clearly stalled.
-            if (pipeline->ReportStuckOnce(PipelineBuildTrace::STUCK_BUILD_AGE)) {
-                LOG_ERROR(Render_Vulkan,
-                          "[PipelineTimeout] graphics 0x{:016x} still not built after {} ms",
-                          pipeline->KeyHash(), PipelineBuildTrace::STUCK_BUILD_AGE.count());
-                ReplaceStuckWorker();
-                RecordStuckPipeline(false, pipeline->KeyHash());
-            }
             return nullptr;
         }
     }
     // This draw has to wait for its pipeline. Wait here, for a bounded time, instead of handing
     // back an unbuilt pipeline: the command stream would then wait on it with no limit, and a
     // pipeline the driver never finishes would freeze emulation for good.
-    const u64 hash{pipeline->KeyHash()};
     return WaitForUnskippable(pipeline, "graphics", hash, false, hash) ? pipeline : nullptr;
 }
 

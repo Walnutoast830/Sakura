@@ -139,6 +139,11 @@ private:
     [[nodiscard]] bool WaitForUnskippable(Pipeline* pipeline, const char* kind, u64 hash,
                                           bool compute, u64 cache_key_hash);
 
+    /// Records and works around a build a worker has been stuck on for STUCK_BUILD_AGE.
+    template <typename Pipeline>
+    void CheckForStuckBuild(Pipeline* pipeline, const char* kind, u64 hash, bool compute,
+                            u64 cache_key_hash);
+
     /// Lets one more shader worker run, replacing a worker stuck inside the driver.
     void ReplaceStuckWorker();
 
@@ -244,8 +249,12 @@ private:
     std::filesystem::path stuck_list_filename;
     size_t checkpoint_size{};
 
-    Common::ThreadWorker workers;
-    Common::ThreadWorker serialization_thread;
+    // Heap-owned so shutdown can leak them instead of joining a thread stuck inside the driver,
+    // which would never return. `workers` and `serialization_thread` alias these.
+    std::unique_ptr<Common::ThreadWorker> worker_pool;
+    std::unique_ptr<Common::ThreadWorker> serialization_pool;
+    Common::ThreadWorker& workers;
+    Common::ThreadWorker& serialization_thread;
     DynamicFeatures dynamic_features;
 };
 

@@ -52,6 +52,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     num_descriptor_entries = NumDescriptorEntries(info);
 
     auto func{[this, &scheduler, &descriptor_pool, shader_notify, pipeline_statistics] {
+        build_gate.MarkStarted();
         std::optional<PipelineBuildTrace::BuildScope> build_trace;
         build_trace.emplace("compute", shader_hash);
         DescriptorLayoutBuilder builder{device};

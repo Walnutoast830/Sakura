@@ -56,28 +56,40 @@ public:
         return !gave_up.exchange(true, std::memory_order_relaxed);
     }
 
-    /// Returns true once, the first time it is called after the pipeline has gone unbuilt for at
-    /// least `min_age` since it was created. Used to replace the worker a stuck build holds.
-    bool ReportStuckOnce(bool built, std::chrono::milliseconds min_age) noexcept {
+    /// Called by the worker when it starts the build. Until then the pipeline is only queued.
+    void MarkStarted() noexcept {
+        started_at_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                            std::memory_order_release);
+    }
+
+    /// Returns true once, the first time it is called after a worker has been building the
+    /// pipeline for at least `min_age`. A pipeline still waiting in the queue is never reported:
+    /// it is not stuck, it is waiting for a worker.
+    bool ReportStuckOnce(bool built, std::chrono::nanoseconds min_age) noexcept {
         if (built || reported_stuck.load(std::memory_order_relaxed)) {
             return false;
         }
-        if (std::chrono::steady_clock::now() - created < min_age) {
+        const auto started = started_at_ns.load(std::memory_order_acquire);
+        if (started == 0) {
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        if (std::chrono::nanoseconds{now - started} < min_age) {
             return false;
         }
         return !reported_stuck.exchange(true, std::memory_order_relaxed);
     }
 
 private:
-    std::chrono::steady_clock::time_point created{std::chrono::steady_clock::now()};
+    std::atomic<std::chrono::steady_clock::rep> started_at_ns{0};
     std::atomic_bool gave_up{false};
     std::atomic_bool reported_stuck{false};
 };
 
-/// A build still unfinished this long after its pipeline was requested is treated as stuck in the
-/// driver, even if no draw had to wait on it. Longer than BUILD_TIMEOUT because it also counts
-/// time spent queued behind other builds.
-constexpr auto STUCK_BUILD_AGE = std::chrono::milliseconds{10000};
+/// A worker that has spent this long on one build is treated as stuck in the driver. Normal
+/// builds take well under a second; measured from when the worker started, not from the request,
+/// so time spent queued behind other builds never counts.
+constexpr auto STUCK_BUILD_AGE = std::chrono::milliseconds{5000};
 
 /// Kernel thread id on Linux/Android, so it matches the TID column of `ps -T`.
 inline u64 ThreadId() {

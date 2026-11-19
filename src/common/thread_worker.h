@@ -132,6 +132,21 @@ public:
         });
     }
 
+    /// Asks every thread to stop after its current task, without waiting for them. Queued tasks
+    /// are dropped. For shutting down a pool that is about to be leaked because some task in it
+    /// never returns.
+    void RequestStop() {
+        {
+            std::scoped_lock lock{queue_mutex};
+            requests.clear();
+            pending.clear();
+        }
+        for (auto& thread : threads) {
+            thread.request_stop();
+        }
+        condition.notify_all();
+    }
+
     /// Like WaitForRequests, but gives up once no queued task has finished for `stall`.
     /// Returns true when all work finished, false when it gave up on tasks that stopped
     /// progressing (they keep running; the caller must not wait on them).

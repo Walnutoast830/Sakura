@@ -313,6 +313,7 @@ GraphicsPipeline::GraphicsPipeline(
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
     auto func{[this, shader_notify, &render_pass_cache, &descriptor_pool, pipeline_statistics,
               worker_thread] {
+        build_gate.MarkStarted();
         std::optional<PipelineBuildTrace::BuildScope> build_trace;
         build_trace.emplace("graphics", key.Hash());
         DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
