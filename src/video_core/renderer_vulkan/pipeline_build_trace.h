@@ -32,7 +32,7 @@ constexpr auto WAIT_REPORT_INTERVAL = std::chrono::seconds{5};
 /// How long a draw or dispatch that cannot be skipped waits for its pipeline before giving up.
 /// Normal builds finish in well under a second; some Mali drivers never return from
 /// vkCreate*Pipelines for certain shaders, and waiting on those freezes emulation for good.
-constexpr auto BUILD_TIMEOUT = std::chrono::milliseconds{2000};
+constexpr auto BUILD_TIMEOUT = std::chrono::milliseconds{1000};
 
 /// Tracks a pipeline whose build has outlived BUILD_TIMEOUT, so later draws skip it at once
 /// instead of waiting again. Cleared implicitly once the build finishes.

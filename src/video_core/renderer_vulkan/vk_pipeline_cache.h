@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <span>
 #include <type_traits>
@@ -135,10 +136,18 @@ private:
     /// Waits a bounded time for a pipeline a draw or dispatch cannot skip. Returns whether it is
     /// built; on timeout the pipeline is marked so later uses skip it without waiting.
     template <typename Pipeline>
-    [[nodiscard]] bool WaitForUnskippable(Pipeline* pipeline, const char* kind, u64 hash);
+    [[nodiscard]] bool WaitForUnskippable(Pipeline* pipeline, const char* kind, u64 hash,
+                                          bool compute, u64 cache_key_hash);
 
     /// Lets one more shader worker run, replacing a worker stuck inside the driver.
     void ReplaceStuckWorker();
+
+    /// Pipelines the driver got stuck building. They are never built again: building one would
+    /// only tie up another worker for good. Keyed by the pipeline cache key hash and stored per
+    /// title next to the shader cache, so they are also skipped when the cache is loaded.
+    [[nodiscard]] bool IsStuckPipeline(bool compute, u64 cache_key_hash);
+    void RecordStuckPipeline(bool compute, u64 cache_key_hash);
+    void LoadStuckPipelineList();
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
 
@@ -229,6 +238,10 @@ private:
     size_t worker_threads{};
     /// Builds that outlived the timeout. Each keeps a worker busy, possibly forever.
     std::atomic<size_t> stuck_builds{};
+    std::mutex stuck_list_mutex;
+    ankerl::unordered_dense::set<u64> stuck_graphics;
+    ankerl::unordered_dense::set<u64> stuck_compute;
+    std::filesystem::path stuck_list_filename;
     size_t checkpoint_size{};
 
     Common::ThreadWorker workers;

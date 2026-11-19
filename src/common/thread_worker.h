@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -129,6 +130,33 @@ public:
         wait_condition.wait(lock, [this] {
             return workers_stopped >= workers_queued || work_done >= work_scheduled;
         });
+    }
+
+    /// Like WaitForRequests, but gives up once no queued task has finished for `stall`.
+    /// Returns true when all work finished, false when it gave up on tasks that stopped
+    /// progressing (they keep running; the caller must not wait on them).
+    bool WaitForRequestsWhileProgressing(std::stop_token stop_token,
+                                         std::chrono::milliseconds stall) {
+        std::stop_callback callback(stop_token, [this] {
+            for (auto& thread : threads) {
+                thread.request_stop();
+            }
+        });
+        std::unique_lock lock{queue_mutex};
+        size_t last_done = work_done.load();
+        auto last_progress = std::chrono::steady_clock::now();
+        while (!(workers_stopped >= workers_queued || work_done >= work_scheduled)) {
+            wait_condition.wait_for(lock, std::chrono::milliseconds{250});
+            const auto now = std::chrono::steady_clock::now();
+            const size_t done = work_done.load();
+            if (done != last_done) {
+                last_done = done;
+                last_progress = now;
+            } else if (now - last_progress >= stall) {
+                return false;
+            }
+        }
+        return true;
     }
 
 private:

@@ -817,6 +817,12 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     const auto [pair, is_new]{compute_cache.try_emplace(key)};
     auto& pipeline{pair->second};
     if (is_new) {
+        if (IsStuckPipeline(true, key.Hash())) {
+            // The driver got stuck on this one before; leave it unbuilt and skip its dispatches.
+            LOG_WARNING(Render_Vulkan, "[PipelineTimeout] skipping known-stuck compute 0x{:016x}",
+                        shader->unique_hash);
+            return nullptr;
+        }
         pipeline = CreateComputePipeline(key, shader);
     }
     ComputePipeline* const compute{pipeline.get()};
@@ -825,11 +831,14 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     }
     // Dispatches always wait for their pipeline. Bound that wait here: a dispatch on a pipeline the
     // driver never finishes would otherwise block the command stream, and emulation, for good.
-    return WaitForUnskippable(compute, "compute", compute->ShaderHash()) ? compute : nullptr;
+    return WaitForUnskippable(compute, "compute", compute->ShaderHash(), true, key.Hash())
+               ? compute
+               : nullptr;
 }
 
 template <typename Pipeline>
-bool PipelineCache::WaitForUnskippable(Pipeline* pipeline, const char* kind, u64 hash) {
+bool PipelineCache::WaitForUnskippable(Pipeline* pipeline, const char* kind, u64 hash,
+                                       bool compute, u64 cache_key_hash) {
     if (pipeline->BuildGaveUp()) {
         // Already waited the full timeout once; skip without stalling again.
         return false;
@@ -846,8 +855,57 @@ bool PipelineCache::WaitForUnskippable(Pipeline* pipeline, const char* kind, u64
     // The wait just covered BUILD_TIMEOUT, so the build counts as stuck now.
     if (pipeline->ReportStuckOnce(std::chrono::milliseconds{0})) {
         ReplaceStuckWorker();
+        RecordStuckPipeline(compute, cache_key_hash);
     }
     return false;
+}
+
+bool PipelineCache::IsStuckPipeline(bool compute, u64 cache_key_hash) {
+    std::scoped_lock lock{stuck_list_mutex};
+    return (compute ? stuck_compute : stuck_graphics).contains(cache_key_hash);
+}
+
+void PipelineCache::RecordStuckPipeline(bool compute, u64 cache_key_hash) {
+    std::scoped_lock lock{stuck_list_mutex};
+    if (!(compute ? stuck_compute : stuck_graphics).insert(cache_key_hash).second) {
+        return;
+    }
+    if (stuck_list_filename.empty()) {
+        return;
+    }
+    // Plain text, one entry per line, so it can be read or deleted by hand. Clearing the shader
+    // cache removes it together with the cache it belongs to.
+    std::ofstream file(stuck_list_filename, std::ios::app);
+    if (file) {
+        file << (compute ? "compute " : "graphics ") << fmt::format("{:016x}", cache_key_hash)
+             << '\n';
+    }
+    LOG_WARNING(Render_Vulkan, "[PipelineTimeout] {} {:016x} added to {}",
+                compute ? "compute" : "graphics", cache_key_hash,
+                stuck_list_filename.filename().string());
+}
+
+void PipelineCache::LoadStuckPipelineList() {
+    std::ifstream file(stuck_list_filename);
+    if (!file) {
+        return;
+    }
+    std::scoped_lock lock{stuck_list_mutex};
+    std::string kind;
+    std::string hex;
+    while (file >> kind >> hex) {
+        u64 value{};
+        try {
+            value = std::stoull(hex, nullptr, 16);
+        } catch (const std::exception&) {
+            continue;
+        }
+        (kind == "compute" ? stuck_compute : stuck_graphics).insert(value);
+    }
+    LOG_WARNING(Render_Vulkan,
+                "[PipelineTimeout] {} graphics and {} compute pipelines are known to get the "
+                "driver stuck; they will be skipped",
+                stuck_graphics.size(), stuck_compute.size());
 }
 
 void PipelineCache::ReplaceStuckWorker() {
@@ -898,7 +956,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
     }
 
-    struct {
+    stuck_list_filename = base_dir / "stuck_pipelines.txt";
+    LoadStuckPipelineList();
+
+    struct LoadState {
         std::mutex mutex;
         size_t total{};
         size_t built{};
@@ -906,13 +967,22 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         size_t compiled{};
         size_t failed{};
         bool has_loaded{};
+        // Set when loading stops waiting on builds that stopped progressing. Builds that finish
+        // afterwards must not touch the caches, which the GPU thread is using by then.
+        bool abandoned{};
         // A cache file is append-only, so an entry may be present more than once (for example if
         // a build was interrupted between the SPIR-V and driver cache write, or after a cache
         // version bump). Building the same pipeline twice at boot is pure wasted driver time.
         ankerl::unordered_dense::set<ComputePipelineCacheKey> seen_compute;
         ankerl::unordered_dense::set<GraphicsPipelineCacheKey> seen_graphics;
+        // Builds currently running, so the ones still running when loading gives up are known.
+        ankerl::unordered_dense::set<u64> in_flight_compute;
+        ankerl::unordered_dense::set<u64> in_flight_graphics;
         std::unique_ptr<PipelineStatistics> statistics;
-    } state;
+    };
+    // Shared with the build tasks: a task stuck in the driver can outlive this function.
+    const auto state_ptr{std::make_shared<LoadState>()};
+    auto& state{*state_ptr};
 
     if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
         state.statistics = std::make_unique<PipelineStatistics>(device);
@@ -925,9 +995,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         if (!state.seen_compute.insert(key).second) {
             return;
         }
+        if (IsStuckPipeline(true, key.Hash())) {
+            return;
+        }
 
         workers.QueueWork([this, key, env_ = std::move(env), payload = std::move(payload),
-                           &state, &callback]() mutable {
+                           state_ptr, callback]() mutable {
+            auto& state{*state_ptr};
+            {
+                std::scoped_lock lock{state.mutex};
+                state.in_flight_compute.insert(key.Hash());
+            }
             std::unique_ptr<ComputePipeline> pipeline;
             bool from_disk{false};
             if (!payload.empty()) {
@@ -946,6 +1024,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 pipeline = CreateComputePipeline(pools, key, env_, state.statistics.get(), false);
             }
             std::scoped_lock lock{state.mutex};
+            state.in_flight_compute.erase(key.Hash());
+            if (state.abandoned) {
+                // Loading already moved on without this one; the GPU thread owns the cache now.
+                return;
+            }
             const bool built_ok{pipeline != nullptr};
             if (built_ok) {
                 compute_cache.emplace(key, std::move(pipeline));
@@ -1000,9 +1083,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         if (!state.seen_graphics.insert(key).second) {
             return;
         }
+        if (IsStuckPipeline(false, key.Hash())) {
+            return;
+        }
 
         workers.QueueWork([this, key, envs_ = std::move(envs), payload = std::move(payload),
-                           &state, &callback]() mutable {
+                           state_ptr, callback]() mutable {
+            auto& state{*state_ptr};
+            {
+                std::scoped_lock lock{state.mutex};
+                state.in_flight_graphics.insert(key.Hash());
+            }
             std::unique_ptr<GraphicsPipeline> pipeline;
             bool from_disk{false};
             if (!payload.empty()) {
@@ -1026,6 +1117,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             }
 
             std::scoped_lock lock{state.mutex};
+            state.in_flight_graphics.erase(key.Hash());
+            if (state.abandoned) {
+                // Loading already moved on without this one; the GPU thread owns the cache now.
+                return;
+            }
             const bool built_ok{pipeline != nullptr};
             if (built_ok) {
                 graphics_cache.emplace(key, std::move(pipeline));
@@ -1054,8 +1150,36 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     state.has_loaded = true;
     lock.unlock();
 
-    workers.WaitForRequests(stop_loading);
-    workers.SetActiveThreads(play_workers);
+    // Wait for the cached pipelines, but not for ones the driver got stuck on: those would hold the
+    // loading screen forever. Give up once nothing has finished for STARTUP_STALL.
+    constexpr auto STARTUP_STALL = std::chrono::milliseconds{5000};
+    const bool all_built{workers.WaitForRequestsWhileProgressing(stop_loading, STARTUP_STALL)};
+    size_t stuck_at_startup{};
+    if (!all_built) {
+        std::vector<std::pair<bool, u64>> stuck;
+        {
+            std::scoped_lock state_lock{state.mutex};
+            state.abandoned = true;
+            for (const u64 hash : state.in_flight_graphics) {
+                stuck.emplace_back(false, hash);
+            }
+            for (const u64 hash : state.in_flight_compute) {
+                stuck.emplace_back(true, hash);
+            }
+        }
+        stuck_at_startup = stuck.size();
+        LOG_ERROR(Render_Vulkan,
+                  "[PipelineTimeout] {} cached pipeline(s) made no progress for {} ms at startup; "
+                  "continuing without them",
+                  stuck_at_startup, STARTUP_STALL.count());
+        for (const auto& [compute, hash] : stuck) {
+            RecordStuckPipeline(compute, hash);
+        }
+    }
+    // Each stuck build keeps its worker; count them so play still gets its full worker budget.
+    stuck_builds.fetch_add(stuck_at_startup, std::memory_order_relaxed);
+    workers.SetActiveThreads(
+        std::min(play_workers + stuck_builds.load(std::memory_order_relaxed), worker_threads));
 
     // Every pipeline above was created inside the worker threads, which calls
     // vkCreateGraphicsPipelines/vkCreateComputePipelines. That is the GPU warmup: by the time the
@@ -1070,14 +1194,16 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         LOG_INFO(Render_Vulkan, "[ShaderWarmup] Cold start: no cached pipelines for this title");
     }
 
-    if (use_vulkan_pipeline_cache) {
+    // Reading the driver cache while a build is stuck inside the same cache could block on that
+    // build; the periodic checkpoint saves it later from its own thread instead.
+    if (use_vulkan_pipeline_cache && all_built) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
         SerializeVulkanPipelineCache(global_vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION, MAX_GLOBAL_PIPELINE_CACHE_SIZE);
     }
 
-    if (state.statistics) {
+    if (all_built && state.statistics) {
         state.statistics->Report();
     }
 }
@@ -1125,6 +1251,7 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
                           "[PipelineTimeout] graphics 0x{:016x} still not built after {} ms",
                           pipeline->KeyHash(), PipelineBuildTrace::STUCK_BUILD_AGE.count());
                 ReplaceStuckWorker();
+                RecordStuckPipeline(false, pipeline->KeyHash());
             }
             return nullptr;
         }
@@ -1132,7 +1259,8 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
     // This draw has to wait for its pipeline. Wait here, for a bounded time, instead of handing
     // back an unbuilt pipeline: the command stream would then wait on it with no limit, and a
     // pipeline the driver never finishes would freeze emulation for good.
-    return WaitForUnskippable(pipeline, "graphics", pipeline->KeyHash()) ? pipeline : nullptr;
+    const u64 hash{pipeline->KeyHash()};
+    return WaitForUnskippable(pipeline, "graphics", hash, false, hash) ? pipeline : nullptr;
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
@@ -1319,6 +1447,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipelineFromCache
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+    if (IsStuckPipeline(false, graphics_key.Hash())) {
+        // The driver got stuck on this one before. Leave it unbuilt (the cache keeps the null
+        // entry, so this runs once per pipeline) and let its draws be skipped.
+        LOG_WARNING(Render_Vulkan, "[PipelineTimeout] skipping known-stuck graphics 0x{:016x}",
+                    graphics_key.Hash());
+        return nullptr;
+    }
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
 
