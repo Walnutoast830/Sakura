@@ -497,6 +497,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
               "VkPipelineBuilder"),
       serialization_thread(1, "VkPipelineSerialization") {
     play_workers = device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers();
+    worker_threads = device.HasBrokenParallelShaderCompiling() ? 1ULL : GetBootPipelineWorkers();
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -815,11 +816,48 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     };
     const auto [pair, is_new]{compute_cache.try_emplace(key)};
     auto& pipeline{pair->second};
-    if (!is_new) {
-        return pipeline.get();
+    if (is_new) {
+        pipeline = CreateComputePipeline(key, shader);
     }
-    pipeline = CreateComputePipeline(key, shader);
-    return pipeline.get();
+    ComputePipeline* const compute{pipeline.get()};
+    if (!compute || compute->IsBuilt()) {
+        return compute;
+    }
+    // Dispatches always wait for their pipeline. Bound that wait here: a dispatch on a pipeline the
+    // driver never finishes would otherwise block the command stream, and emulation, for good.
+    return WaitForUnskippable(compute, "compute", compute->ShaderHash()) ? compute : nullptr;
+}
+
+template <typename Pipeline>
+bool PipelineCache::WaitForUnskippable(Pipeline* pipeline, const char* kind, u64 hash) {
+    if (pipeline->BuildGaveUp()) {
+        // Already waited the full timeout once; skip without stalling again.
+        return false;
+    }
+    if (pipeline->WaitUntilBuilt(PipelineBuildTrace::BUILD_TIMEOUT)) {
+        return true;
+    }
+    if (pipeline->MarkBuildGaveUp()) {
+        LOG_ERROR(Render_Vulkan,
+                  "[PipelineTimeout] {} 0x{:016x} not built after {} ms; skipping its draws until "
+                  "the driver finishes it",
+                  kind, hash, PipelineBuildTrace::BUILD_TIMEOUT.count());
+    }
+    // The wait just covered BUILD_TIMEOUT, so the build counts as stuck now.
+    if (pipeline->ReportStuckOnce(std::chrono::milliseconds{0})) {
+        ReplaceStuckWorker();
+    }
+    return false;
+}
+
+void PipelineCache::ReplaceStuckWorker() {
+    // A build the driver never finishes keeps its worker thread forever. Without a replacement,
+    // a few such shaders would leave no worker to build anything else.
+    const size_t stuck = stuck_builds.fetch_add(1, std::memory_order_relaxed) + 1;
+    const size_t active = std::min(play_workers + stuck, worker_threads);
+    workers.SetActiveThreads(active);
+    LOG_WARNING(Render_Vulkan, "[PipelineTimeout] {} stuck build(s); {} of {} shader workers active",
+                stuck, active, worker_threads);
 }
 
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
@@ -1064,21 +1102,37 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     return BuiltPipeline(current_pipeline);
 }
 
-GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {
+GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexcept {
     if (pipeline->IsBuilt()) {
         return pipeline;
     }
-    if (!use_asynchronous_shaders) {
-        return pipeline;
+    if (pipeline->BuildGaveUp()) {
+        // An earlier draw already waited the full timeout on this pipeline: skip at once.
+        return nullptr;
     }
-    // If games are using a small index count, we can assume these are full screen quads.
-    // Usually these shaders are only used once for building textures so we can assume they
-    // can't be built async
-    const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    if (draw_state.index_buffer.count <= 6 || draw_state.vertex_buffer.count <= 6) {
-        return pipeline;
+    if (use_asynchronous_shaders) {
+        // If games are using a small index count, we can assume these are full screen quads.
+        // Usually these shaders are only used once for building textures so we can assume they
+        // can't be built async
+        const auto& draw_state = maxwell3d->draw_manager.draw_state;
+        const bool must_wait =
+            draw_state.index_buffer.count <= 6 || draw_state.vertex_buffer.count <= 6;
+        if (!must_wait) {
+            // Skipped without waiting, but a build the driver never finishes still holds a
+            // worker. Replace it once the build has clearly stalled.
+            if (pipeline->ReportStuckOnce(PipelineBuildTrace::STUCK_BUILD_AGE)) {
+                LOG_ERROR(Render_Vulkan,
+                          "[PipelineTimeout] graphics 0x{:016x} still not built after {} ms",
+                          pipeline->KeyHash(), PipelineBuildTrace::STUCK_BUILD_AGE.count());
+                ReplaceStuckWorker();
+            }
+            return nullptr;
+        }
     }
-    return nullptr;
+    // This draw has to wait for its pipeline. Wait here, for a bounded time, instead of handing
+    // back an unbuilt pipeline: the command stream would then wait on it with no limit, and a
+    // pipeline the driver never finishes would freeze emulation for good.
+    return WaitForUnskippable(pipeline, "graphics", pipeline->KeyHash()) ? pipeline : nullptr;
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(

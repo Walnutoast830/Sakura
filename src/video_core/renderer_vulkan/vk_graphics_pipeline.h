@@ -18,6 +18,7 @@
 #include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -120,6 +121,31 @@ public:
         return is_built.load(std::memory_order::relaxed);
     }
 
+    /// Waits up to `timeout` for the build to finish. Returns whether the pipeline is built.
+    bool WaitUntilBuilt(std::chrono::milliseconds timeout) {
+        return PipelineBuildTrace::BuildGate::WaitFor(
+            build_condvar, build_mutex, [this] { return IsBuilt(); }, timeout);
+    }
+
+    /// True when an earlier wait gave up on this pipeline and it has still not been built.
+    [[nodiscard]] bool BuildGaveUp() const noexcept {
+        return build_gate.GaveUp(IsBuilt());
+    }
+
+    /// Records that a wait gave up. Returns true only the first time.
+    bool MarkBuildGaveUp() noexcept {
+        return build_gate.MarkGaveUp();
+    }
+
+    /// Returns true once, when the build has been unfinished for at least `min_age`.
+    bool ReportStuckOnce(std::chrono::milliseconds min_age) noexcept {
+        return build_gate.ReportStuckOnce(IsBuilt(), min_age);
+    }
+
+    [[nodiscard]] u64 KeyHash() const noexcept {
+        return key.Hash();
+    }
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
@@ -189,6 +215,7 @@ private:
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};
+    PipelineBuildTrace::BuildGate build_gate;
     bool uses_push_descriptor{false};
 };
 

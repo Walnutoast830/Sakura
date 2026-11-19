@@ -105,7 +105,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                          exception.what());
             std::scoped_lock lock{build_mutex};
             is_built = true;
-            build_condvar.notify_one();
+            build_condvar.notify_all();
             if (shader_notify) {
                 shader_notify->MarkShaderComplete();
             }
@@ -124,7 +124,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         }
         std::scoped_lock lock{build_mutex};
         is_built = true;
-        build_condvar.notify_one();
+        build_condvar.notify_all();
         if (shader_notify) {
             shader_notify->MarkShaderComplete();
         }

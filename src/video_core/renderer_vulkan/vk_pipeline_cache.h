@@ -130,7 +130,15 @@ private:
     /// this has to run again after a channel switch.
     void ArmMaxwellBypassEngine();
 
-    [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
+    [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) noexcept;
+
+    /// Waits a bounded time for a pipeline a draw or dispatch cannot skip. Returns whether it is
+    /// built; on timeout the pipeline is marked so later uses skip it without waiting.
+    template <typename Pipeline>
+    [[nodiscard]] bool WaitForUnskippable(Pipeline* pipeline, const char* kind, u64 hash);
+
+    /// Lets one more shader worker run, replacing a worker stuck inside the driver.
+    void ReplaceStuckWorker();
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
 
@@ -217,6 +225,10 @@ private:
     std::atomic<u64> spv_emit_us{};
     std::atomic<u32> spv_modules{};
     size_t play_workers{};
+    /// Threads the worker pool was created with; the most that can ever run at once.
+    size_t worker_threads{};
+    /// Builds that outlived the timeout. Each keeps a worker busy, possibly forever.
+    std::atomic<size_t> stuck_builds{};
     size_t checkpoint_size{};
 
     Common::ThreadWorker workers;
