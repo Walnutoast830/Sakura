@@ -12,6 +12,7 @@
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 
+#include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
@@ -312,6 +313,8 @@ GraphicsPipeline::GraphicsPipeline(
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
     auto func{[this, shader_notify, &render_pass_cache, &descriptor_pool, pipeline_statistics,
               worker_thread] {
+        std::optional<PipelineBuildTrace::BuildScope> build_trace;
+        build_trace.emplace("graphics", key.Hash());
         DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
         uses_push_descriptor = builder.CanUsePushDescriptor();
         descriptor_set_layout = builder.CreateDescriptorSetLayout(uses_push_descriptor);
@@ -332,6 +335,8 @@ GraphicsPipeline::GraphicsPipeline(
             guard = std::shared_lock<std::shared_mutex>{*cache_lock};
         }
         MakePipeline(render_pass);
+        // Log "end" as soon as the driver returns, before anything else can stall this thread.
+        build_trace.reset();
         if (pipeline_statistics) {
             pipeline_statistics->Collect(device, *pipeline);
         }
@@ -589,7 +594,10 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
             std::unique_lock lock{build_mutex};
-            build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+            PipelineBuildTrace::WaitForBuild(
+                build_condvar, lock,
+                [this] { return is_built.load(std::memory_order::relaxed); }, "graphics",
+                key.Hash());
         });
     }
     const bool is_rescaling{texture_cache.IsRescaling()};

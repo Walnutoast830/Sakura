@@ -6,16 +6,17 @@ on:
       flavors:
         description: 'Gradle tasks to run'
         required: false
-        default: 'assembleMainlineRelease'
+        default: 'assembleOptimizedRelWithDebInfo'
         type: choice
         options:
+          - assembleOptimizedRelWithDebInfo
           - assembleMainlineRelease
           - assembleOptimizedRelease
           - assembleLegacyRelease
           - 'assembleMainlineRelease assembleLegacyRelease'
           - 'assembleMainlineRelease assembleLegacyRelease assembleChromeOSRelease assembleGenshinSpoofRelease'
   push:
-    branches: [main]
+    branches: [main, pipeline-build-logging]
     paths:
       - 'src/**'
       - 'CMakeLists.txt'
@@ -88,7 +89,7 @@ jobs:
 
       - name: Build APKs
         working-directory: src/android
-        run: ./gradlew ${{ inputs.flavors || 'assembleMainlineRelease' }} --stacktrace
+        run: ./gradlew ${{ inputs.flavors || (github.ref_name == 'pipeline-build-logging' && 'assembleOptimizedRelWithDebInfo' || 'assembleMainlineRelease') }} --stacktrace
 
       - name: Collect APKs
         if: always()

@@ -10,6 +10,7 @@
 #include <boost/container/small_vector.hpp>
 #include <fmt/format.h>
 
+#include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -51,6 +52,8 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     num_descriptor_entries = NumDescriptorEntries(info);
 
     auto func{[this, &scheduler, &descriptor_pool, shader_notify, pipeline_statistics] {
+        std::optional<PipelineBuildTrace::BuildScope> build_trace;
+        build_trace.emplace("compute", shader_hash);
         DescriptorLayoutBuilder builder{device};
         builder.Add(info, VK_SHADER_STAGE_COMPUTE_BIT);
 
@@ -95,7 +98,9 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                 guard = std::shared_lock<std::shared_mutex>{*cache_lock};
             }
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+            build_trace.reset();
         } catch (const vk::Exception& exception) {
+            build_trace.reset();
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
             std::scoped_lock lock{build_mutex};
@@ -245,7 +250,10 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
             std::unique_lock lock{build_mutex};
-            build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+            PipelineBuildTrace::WaitForBuild(
+                build_condvar, lock,
+                [this] { return is_built.load(std::memory_order::relaxed); }, "compute",
+                shader_hash);
         });
     }
 
