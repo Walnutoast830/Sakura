@@ -21,6 +21,8 @@ include(GenerateSCMRev)
 
 add_library(
     common STATIC
+    adpf.cpp
+    adpf.h
     address_space.cpp
     address_space.h
     algorithm.h
