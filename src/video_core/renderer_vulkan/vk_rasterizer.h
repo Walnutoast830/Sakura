@@ -157,7 +157,6 @@ public:
                                                             VAddr framebuffer_addr,
                                                             u32 pixel_stride);
 
-    std::optional<AsrDepth> TakeDepth(u32 w, u32 h);
 
     /// Exposes the texture cache so the renderer can drop its rescaled copies when the internal
     /// resolution changes while a game is running.

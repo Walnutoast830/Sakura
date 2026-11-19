@@ -1065,20 +1065,6 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     return info;
 }
 
-std::optional<AsrDepth> RasterizerVulkan::TakeDepth(u32 w, u32 h) {
-    std::scoped_lock lock{texture_cache.mutex};
-    bool inv = false;
-    ImageView* const iv = texture_cache.TakeSceneDepth(w, h, inv);
-    if (!iv) {
-        return std::nullopt;
-    }
-    const VkImageView dv = iv->DepthView();
-    if (dv == VK_NULL_HANDLE) {
-        return std::nullopt;
-    }
-    return AsrDepth{dv, iv->size.width, iv->size.height, inv};
-}
-
 void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                          const VideoCore::DiskResourceLoadCallback& callback) {
     pipeline_cache.LoadDiskResources(title_id, stop_loading, callback);
